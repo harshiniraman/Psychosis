@@ -1,0 +1,415 @@
+---
+title: "bins with bbl"
+author: "Harshini Raman"
+date: "10/04/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+pacman::p_load(tidyverse, bigrquery, dbplyr, survival, InformationValue, ontologyPlot, ontologyIndex, ontologySimilarity, rlang, gtsummary, vcd, rsample, glmnet, yardstick, magrittr)
+data(hpo)
+
+library(dbplyr)
+```
+
+## Setting the connection to the lab
+
+```{r}
+bq_auth(path='/vault/secrets/gcp-sa-default.json')  # this path will change to the env variable, but showing for now
+project_id <- bq_projects() 
+```
+
+```{r}
+
+con <- dbConnect(
+  bigrquery::bigquery(),
+  project = "scit414-psd-ae773671", 
+  dataset = "arcus"
+)
+```
+
+
+## Create a function to get the ancestors of a given HPO term 
+
+```{r}
+get_ancestors <- function(hp){
+  c(hp, hpo$ancestors[[hp]])
+}
+```
+
+## Filter out for annotations with certain modifiers  
+
+```{r}
+cohort_annotations_m <- cohort_annotations %>% 
+  filter(negated == "FALSE", history_of == "FALSE", subject == "patient")
+
+
+cohort_annotations_m
+```
+
+
+## Getting a list of epic_pat_id who have 22q, with option to filter for a certain age. This is 1008 pts with 22q 
+
+## Output is a column of epic_pat_id who have 22q 
+
+```{r}
+patient_list <- cohort_annotations_m %>% 
+  select(epic_note_id) %>% 
+  inner_join(note_info %>% 
+               filter(!is.na(note_entry_datetime)) %>% 
+                        select(epic_pat_id, epic_note_id, epic_enc_id, note_entry_datetime), by = "epic_note_id") %>%      
+      distinct() %>% 
+   inner_join(patient %>% select(epic_pat_id, dob) %>% distinct(), by = "epic_pat_id") %>% 
+  mutate(age_days = as.integer(lubridate::date(note_entry_datetime) - lubridate::date(dob))) %>% 
+ # filter(age_days > 5110) %>% 
+  select(epic_pat_id) %>% 
+  inner_join(cohorts %>% filter(cohort == "digeorge") %>% select(epic_pat_id) %>% distinct(), by = "epic_pat_id") %>% 
+  distinct() 
+ 
+
+patient_list
+  
+```
+
+
+## Now take the column of epic_pat_id who have 22q and get their note_id, note_entry_datetime, dob, age_days
+
+```{r}
+patient_note_list <- patient_list %>% 
+  inner_join(note_info %>% 
+              filter(!is.na(note_entry_datetime)) %>% 
+              select(epic_pat_id, epic_note_id, note_entry_datetime), by = "epic_pat_id") %>% 
+  inner_join(patient %>% select(epic_pat_id, dob) %>% distinct(), by = "epic_pat_id") %>% 
+  mutate(age_days = as.integer(lubridate::date(note_entry_datetime) - lubridate::date(dob))) %>% 
+  distinct()
+  
+patient_note_list 
+  
+
+```
+
+
+## Now we want to use cohort_annotations_m to: 
+## 1) propogate terms (meaning get the list of ancestor terms for each ontology_code)
+## 2) get rid of any terms that are not within the "phenotypic abnormality" branch (HP:0000118)
+
+## Output is 2 columns, ontology_code, which has the HPO terms, and hp, which has each term's set of ancestor terms. So it should make sense that you will see duplicates in ontology_code. 
+
+```{r}
+ont_hp_all <- cohort_annotations_m %>% 
+  select(ontology_code) %>% 
+  distinct() %>% 
+  rowwise() %>% 
+  mutate(hp =  list(intersection_with_descendants(hpo, c("HP:0000118"), get_ancestors(ontology_code)))) %>% 
+  unnest(cols = (hp))  
+ 
+```
+
+## Now from that two column data set with ontology_code and hp, we want to filter only the psychosis related terms 
+
+## Output is "ont_hp_psyc", which contains a distinct set of psychosis ontology codes and their ancestor terms in the column "hp"
+
+```{r}
+ont_hp_psyc <- ont_hp_all %>% 
+  filter(hp %in% c("HP:0000709", hpo$children$`HP:0000709`, "HP:0100753",  hpo$children$`HP:0100753`,  "HP:0000738", hpo$children$`0000738`, "HP:0000746", hpo$children$`0000746`)) %>% 
+  distinct() %>% 
+  arrange(ontology_code)
+
+ont_hp_psyc
+```
+
+
+
+## Joining patient note list with the cohort annotations data set to have a table that has the hpo terms as well
+
+## Now we are joining the note level data set we made earlier, patient_note_list, with the hpo term level data set with modifiers filtered (cohort_annotations_m)
+
+## Output is data set with epic_pat_id, epic_note_id, note_entry_datetime, dob, age_days, ontology_code, ontology_preferred_text 
+
+## This is everyone with 22q, their note info, their age, dob, and with HPO terms that were not negated 
+
+```{r}
+patient_hp_list <- patient_note_list %>% 
+  inner_join(cohort_annotations_m %>% select(epic_note_id, ontology_code, ontology_preferred_text), by = "epic_note_id")
+
+patient_hp_list
+```
+
+
+
+
+#Here we are taking the above data set patient_hp_list and filtering out missing dob. 
+#Then we are joining with the two column ontology data set "ont_hp_all" 
+# The output of this dataset is 22q patients, their note info, dob, age in days, hpo ancestor terms that are only nonpsychotic terms 
+
+```{r}
+patient_hp_anc_list_1 <- patient_hp_list %>% 
+  filter(!is.na(dob)) %>% 
+  inner_join(ont_hp_all, by = "ontology_code") %>% 
+  full_join(ont_hp_psyc %>% mutate(hp_psyc = TRUE), by = c("hp", "ontology_code")) %>%  
+  distinct() %>% 
+  mutate(hp_psyc = if_else(is.na(hp_psyc), FALSE, hp_psyc))
+
+patient_hp_anc_list_1
+
+  
+```
+
+# Does a particular person ever have a psyc term based on whether or not any of their ontologies have psyc descendent tersm and age_days > 0 
+
+```{r}
+
+patient_hp_anc_list_2 <- patient_hp_anc_list_1 %>% 
+  select(epic_pat_id, epic_note_id, note_entry_datetime, age_days, ontology_code, ontology_preferred_text, hp_psyc)  %>%
+  filter(!is.na(epic_pat_id)) %>%
+  distinct() %>%
+  group_by(epic_pat_id) %>% 
+    mutate(person_psyc = max(hp_psyc)) %>%  # do they have a psyc term ever 
+    mutate(count_hp_psyc = sum(hp_psyc & age_days > 0)) %>%      #counting how many times psyc terms
+  ungroup() %>%
+  mutate(case = as.integer(count_hp_psyc >= 1))
+
+
+patient_hp_anc_list_3 <- patient_hp_anc_list_2  %>%
+  group_by(epic_pat_id)  %>%
+  summarise(oldest_age = max(age_days)) 
+ # filter(between(oldest_age, 3650, 12045))
+  
+  
+```
+
+
+
+```{r}
+patient_hp_anc_list_4 <- patient_hp_anc_list_3  %>% 
+  inner_join(patient_hp_anc_list_2, by = "epic_pat_id")
+```
+
+## Output of this data set is a list of 22q patients categorized by psychosis vs non-psychosis, with age at a given note (calculated using note_entry_date_time), and note/encounter ID's + HPO terms 
+
+```{r}
+
+p_np_m<- patient_hp_anc_list_4
+
+p_np_m
+
+p_np_m %>%
+  summarise(n_distinct(epic_pat_id))
+```
+
+
+
+
+## Getting the data set which has the prodromal/psychotic from clincal research assessment (bbl)
+
+```{sql connection= con, output.var = "pro_or_psy_T1_or_T2"}
+
+  Select epic_pat_id, MAX(pro_or_psy_T1_or_T2) AS pro_or_psy_T1_or_T2
+  FROM arcus.bbl_phenotype
+  WHERE pro_or_psy_T1_or_T2 is not null
+  GROUP BY epic_pat_id
+  ORDER BY epic_pat_id
+
+
+```
+## Combining my data set and bbl data set 
+
+```{r}
+all_patients_notes <- patient_hp_list %>% 
+  inner_join(ont_hp_all, by = "ontology_code") %>% 
+  inner_join(pro_or_psy_T1_or_T2, by = "epic_pat_id")
+```
+
+
+# of patients common to both data sets 
+
+```{r}
+all_patients_notes %>%
+  summarise(n_distinct(epic_pat_id))
+
+```
+
+# Age binning function creation 
+
+```{r}
+quibble <- function(x, q = c(0.25, 0.5, 0.75))  {
+  tibble(x = quantile(x, q), q = q)
+}
+
+
+```
+
+
+## Age Binning 
+
+```{r}
+a <- all_patients_notes %>% 
+   select(epic_pat_id, age_days) %>% 
+  distinct() %>% 
+  summarise(q = quibble(age_days, c(0.25, 0.5, 0.75)))%>% 
+  unnest_wider(col = q) %>% 
+  pivot_wider(names_from = "q", values_from = "x")%>% 
+  tidyr::crossing(all_patients_notes %>% select(epic_pat_id, age_days) %>% distinct()) %>% 
+  mutate(bin = case_when(
+    age_days <= `0.25` ~ 1,
+    age_days <= `0.5` ~ 2,
+    age_days <= `0.75` ~ 3, 
+    TRUE           ~ 4
+  )) %>% 
+  inner_join(all_patients_notes) %>% 
+  select(-c(`0.25`, `0.5`, `0.75`))
+
+a
+
+
+
+```
+## How many individuals per bin
+
+```{r}
+a %>% 
+  group_by(bin)  %>% 
+  summarise(n_distinct(epic_pat_id))
+
+
+```
+
+
+
+
+
+
+
+## Function that creates a univariate model for each hpo term and bin combination
+
+## The point of this model is to see whcih terms are significantly enriched in a given cohort, in a given age bin
+
+```{r}
+model_3 <- function(.data, .hp, .bin){
+  
+  d1 <- .data %>% 
+  filter(bin == .bin) %>% 
+  group_by(epic_pat_id, pro_or_psy_T1_or_T2) %>%
+  summarise(hp = max(hp == .hp)) 
+         #   note_count = n_distinct(epic_note_id), .groups = "drop")
+  #mutate(case = factor(case, labels = c("Psychotic", "Non-Psychotic")))
+  #mutate(case = if_else(case == "Psychotic", 1, 0))
+  
+    m1 <- d1 %>% 
+    glm(pro_or_psy_T1_or_T2 ~ hp, family = "binomial", data =.)
+  p1 <- predict(m1, d1, type = "response")
+  con <- InformationValue::Concordance(d1$pro_or_psy_T1_or_T2, p1)$Concordance
+  
+  r1   <- m1 %>% 
+  broom::tidy(exponentiate = FALSE) %>%     ## Exponentiate = FALSE means log odds ratio 
+  filter(term %in% c("hp", "note_count")) %>% 
+  mutate(Concordance = con)
+  
+  return(r1)
+  
+}
+```
+
+
+
+## Checking that the model works on one term
+
+```{r}
+md <- model_3(a, "HP:0000008", 2)
+
+
+md
+```
+## Creating a table called hp_list_3 with each hp and bin combination with the number of prodromal or psychotic individuals in each bin, and then the sum of the two as a column
+
+## Want to make sure our model has at least 10 in each cohort
+
+```{r}
+hp_list_3<- a %>% 
+  select(epic_pat_id, hp, bin, pro_or_psy_T1_or_T2) %>% 
+  distinct() %>% 
+  count(hp, bin, pro_or_psy_T1_or_T2) %>% 
+  pivot_wider(names_from = "pro_or_psy_T1_or_T2", values_from = "n", 
+              names_prefix = "pro_or_psy_T1_or_T2_") %>% 
+  mutate(sum = pro_or_psy_T1_or_T2_0 + pro_or_psy_T1_or_T2_1) %>% 
+  filter(pro_or_psy_T1_or_T2_0 >10, pro_or_psy_T1_or_T2_1 >10) 
+ 
+# slice(1:10)
+
+
+
+head(hp_list_3)
+```
+
+## Model 3 Output
+```{r}
+l_3_new <- hp_list_3 %>%
+#  filter(case0<881) %>% 
+  #filter(case1<34) %>% 
+  #slice(1:1000) %>% 
+  rowwise() %>% 
+  mutate(result = list(model_3(a, hp, bin))) %>% 
+  unnest(cols = result) %>% 
+  arrange(hp, bin, p.value)
+
+saveRDS(l_3_new, "arcus/shared/data/l_3_new.rds")
+
+```
+
+
+## Visualizations of the models  
+
+Visualization for model 3 - significant even when notes taken into account + bin
+```{r}    
+l_3_plot <- l_3_new %>%  
+ # mutate(adjusted_p_value = p.adjust(p.value, method = "fdr")) %>% 
+ # filter(term == "hp", adjusted_p_value < 0.05) %>% 
+  inner_join(cohort_annotations_m  %>% 
+               select(ontology_preferred_text, ontology_code) %>% 
+               distinct(), 
+             by = c("hp" = "ontology_code"))  %>% 
+  filter(term == "hp", p.value < 0.05) %>%
+  distinct() %>%
+  select(hp, bin, estimate, std.error, ontology_preferred_text) %>% 
+  distinct() %>% 
+  mutate(hp = factor(ontology_preferred_text)) %>% 
+  filter(hp != "NA") %>% 
+  mutate(bin = factor(bin)) %>% 
+  mutate(upper = estimate + 2*std.error) %>% 
+  mutate(lower = estimate -2*std.error) %>% 
+  arrange(desc(lower)) %>% 
+  mutate(hp = forcats::fct_reorder(ontology_preferred_text, lower, .desc = TRUE))  
+
+
+l_3_plot
+```
+## Plot for Model 3
+## Green = PSS, Orange = NPSS
+
+```{r, fig_height = 10}
+
+
+tiff("bin.tiff", units="in", width=10, height=10, res=2000)
+l_3_plot %>% 
+ # filter(bin ==1) %>% 
+  mutate(psychotic = (estimate>0)) %>% 
+  mutate(estimate = abs(estimate)) %>% 
+  ggplot(aes(x = bin, y= 1, col = psychotic, size = estimate))+
+  ylim(-10, 20)+
+  geom_point()+
+  facet_grid(hp~., scales = "free")+
+  theme(strip.text.y = element_text(angle = 0), 
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(), 
+        strip.background = element_blank(), 
+        )+
+ # theme_bw()+
+  theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank())+
+  labs(y = "")
+dev.off()
+
+
+l_3_plot
+
+```
