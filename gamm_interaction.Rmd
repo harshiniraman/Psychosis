@@ -1,0 +1,115 @@
+---
+title: "gamm_interaction"
+author: "Harshini Raman"
+date: '2022-11-19'
+output: html_document
+---
+
+
+# Loading libraries, setting plot parameters 
+
+# case = psychosis
+# non-psychotic = psych illnesses but not psychotic disorders
+# healthy = no psych illness
+
+## Data sets needed: cohorts, note_info, patient, cohort_annotations  located in arcus > lab > shared > data
+
+  
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+#install.packages("pacman")  
+#install.packages("rlang")
+#install.packages("dplyr")
+pacman::p_load(tidyverse, dplyr, ggplot2, broom, mgcv)
+
+
+font_size <- 16
+theme_set(theme_classic(base_family = "sans",base_size = font_size))
+line_size <- 1.5
+point_size <- 2
+
+```
+
+
+Removing enceph patients from cohorts data set 
+```{r}
+cohort_type <- cohorts %>%         
+  select(epic_pat_id, cohort) 
+
+cohort_type 
+```
+
+
+## Joining information about notes, date of birth, and annotations into the data_for_gam 
+
+```{r}
+data_for_gam_long <- cohort_type %>%
+  inner_join(note_info %>% select(epic_pat_id, epic_note_id, note_entry_datetime), by = "epic_pat_id")  %>%
+  inner_join(patient  %>% select(epic_pat_id, dob), by = "epic_pat_id") %>%
+  inner_join(cohort_annotations %>% select(epic_note_id, ontology_preferred_text) %>% distinct() , by = "epic_note_id") %>%
+  distinct()
+
+#saveRDS(data_for_gam_long, "arcus/shared/data/data_for_gam_long.rds")  # can save this data set if you want 
+
+
+data_for_gam_long %>%
+  filter(str_detect(ontology_preferred_text, "deficit"))  ## useful if you want to see if an hpo term is in the data set 
+  
+
+```
+## Pick the HPO term you want to predict 
+## one column with the term or "none" if note doesn't have term 
+
+```{r}
+data_for_gam_long_dt<- data_for_gam_long %>%
+  mutate(ontology_preferred_text = if_else(ontology_preferred_text %in% c("Attention deficit hyperactivity disorder"), ontology_preferred_text, "none")) %>%
+  distinct() %>%
+  mutate(value = 1) %>%
+  data.table::as.data.table()
+
+
+
+
+```
+## Making a wide version of the data set
+## calculating age in days
+## cleaning up the names of the terms 
+
+```{r}
+data_for_gam_wide <- data.table::dcast(data = data_for_gam_long_dt, formula = epic_pat_id + cohort + epic_note_id + note_entry_datetime +dob ~ ontology_preferred_text, fill = 0, value.var = "value") %>%
+  mutate(age_days = as.integer(lubridate::date(note_entry_datetime) - lubridate::date(dob)))  %>%
+  select(-note_entry_datetime, -dob) %>%
+  janitor::clean_names() %>%
+ filter(!is.na(age_days)) 
+```
+
+## Creating a model formula and model object 
+
+```{r}
+model_formula <- as.formula("attention_deficit_hyperactivity_disorder ~ s(age_days, k = 3)")
+modobj <- gamm(model_formula,
+              random = list(epic_pat_id=~1), #We specify a random intercept for subject id (bblid). gamm uses lists for this.
+              data = data_for_gam_wide %>% filter(cohort == "case"),  # specify cohort 
+              family = binomial, 
+              niterPQL=100)        # can change niterPQL (iterations) to how many ever you want 
+
+```
+
+## Plotting our model
+
+```{r}
+
+b_modobj<- b_modobj %>% 
+  mutate(age_years = age_days/365) %>%
+  filter(!is.na(age_years)) %>%
+  mutate(psychotic_disorders = factor(attention_deficit_hyperactivity_disorder, levels = c(1,0), labels = c("ADHD", "Non-ADHD")))
+
+
+b_modobj %>% 
+ggplot(aes(x = age_years, y = exp(.fitted), col = as.factor(attention_deficit_hyperactivity_disorder)))+
+geom_jitter(width = 0.5, alpha = 0.5)+
+ggtitle("attention_deficit_hyperactivity_disorder") 
+```
+
+
